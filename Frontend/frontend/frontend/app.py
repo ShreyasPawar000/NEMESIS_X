@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 import json
 import uuid
+import sys
 import re
 import streamlit as st
 from pathlib import Path
@@ -26,7 +27,20 @@ st.sidebar.markdown(
 st.sidebar.markdown('<div class="side-label">INVESTIGATION WORKSPACE</div>', unsafe_allow_html=True)
 st.sidebar.radio("Navigate", ["Command Centre", "Footage Review", "Anomaly Desk", "Frame Ingest", "NEMESIS AI", "System Status"],
                  key="page", label_visibility="collapsed")
-api_url = st.sidebar.text_input("REASONING ENGINE URL", "http://127.0.0.1:8000").rstrip("/")
+default_api_url = "http://127.0.0.1:8000"
+
+try:
+    default_api_url = st.secrets.get(
+        "BACKEND_URL",
+        default_api_url
+    )
+except Exception:
+    pass
+
+api_url = st.sidebar.text_input(
+    "REASONING ENGINE URL",
+    default_api_url
+).rstrip("/")
 ws_url = "ws" + api_url[len("http"): ] + "/ws/events" if api_url.startswith("http") else ""
 if ws_url:
     start_alert_listener(ws_url)
@@ -100,10 +114,10 @@ elif page == "Footage Review":
         st.success(f"Video loaded: {video.name}")
         if st.button("RUN NEMESIS-X ANALYSIS", type="primary"):
             st.success("Analysis button triggered successfully!")
-            cv_root = Path(
-                r"F:\UG\UG\3rd Sem\Hackathon\computer_vision"
-            )
-            cv_python = cv_root / "venv" / "Scripts" / "python.exe"
+            project_root = Path(__file__).resolve().parents[3]
+
+            cv_root = project_root / "computer_vision"
+            cv_python = Path(sys.executable)
             processor = cv_root / "process_and_ingest.py"
             if not cv_python.exists():
                 st.error("CV Python environment not found.")

@@ -2,3 +2,7 @@ streamlit>=1.40
 requests>=2.31
 websocket-client>=1.8
 streamlit-autorefresh>=1.0.1
+
+# Computer Vision
+ultralytics==8.4.218
+opencv-python-headless
