@@ -1,0 +1,43 @@
+# Python environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Generated outputs
+output/
+**/output/
+
+# Test videos and generated media
+*.avi
+*.mov
+*.mkv
+
+# Local test files
+computer_vision/test.pdf
+project_structure.txt
+
+# IDE configuration
+.vscode/
+.idea/
+
+# Local AI tool configuration
+.claude/
+
+# Temporary files
+*.log
+*.tmp
+
+# Archived experimental CV scripts
+computer_vision/archive/
+
+# Local regression test using generated output
+test_anomaly_detection.py
