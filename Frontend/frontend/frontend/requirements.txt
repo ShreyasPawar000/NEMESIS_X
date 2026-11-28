@@ -5,4 +5,4 @@ streamlit-autorefresh>=1.0.1
 
 # Computer Vision
 ultralytics==8.4.218
-opencv-python-headless
+lap>=0.5.12
