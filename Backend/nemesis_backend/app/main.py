@@ -1,11 +1,22 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    Response,
+    UploadFile,
+    File,
+    Form,
+    HTTPException
+)
+
 from typing import List, Optional
+from pathlib import Path
 import asyncio
 import traceback
-import os
-import cv2
+import shutil
+import re
 import json
-from pathlib import Path
+import cv2
 
 from app.schemas import FramePayload, AnomalyAlert
 from app.memory.temporal_buffer import TemporalMemory
@@ -15,7 +26,22 @@ from app.services.llm_explainer import generate_explanation
 from app.services.pdf_report import generate_pdf_report
 
 
+# ==========================================
+# APPLICATION CONFIGURATION
+# ==========================================
+
 app = FastAPI(title="NEMESIS-X Reasoning Engine")
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+OUTPUT_DIR = BACKEND_DIR / "output"
+
+TRACKED_VIDEO_DIR = OUTPUT_DIR / "tracked_videos"
+TRACKING_DATA_DIR = OUTPUT_DIR / "tracking_data"
+REPORT_DIR = OUTPUT_DIR / "reports"
+
+TRACKED_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+TRACKING_DATA_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ==========================================
@@ -25,10 +51,14 @@ app = FastAPI(title="NEMESIS-X Reasoning Engine")
 video_sessions = {}
 connected_clients: List[WebSocket] = []
 
-ANOMALY_TRIGGER = 0.45   # lowered from 0.65 to catch smaller deviations
-WARMUP_ANOMALY_TRIGGER = 0.40   # lowered from 0.55 to catch warmup anomalies sooner
-WARMUP_CONSECUTIVE_FRAMES = 1   # lowered from 2 — trigger on first anomalous frame
+ANOMALY_TRIGGER = 0.45
+WARMUP_ANOMALY_TRIGGER = 0.40
+WARMUP_CONSECUTIVE_FRAMES = 1
 NORMAL_FRAMES_TO_RESET = 5
+
+SUPPORTED_VIDEO_FORMATS = {
+    ".avi", ".mp4", ".mov", ".mkv"
+}
 
 
 # ==========================================
@@ -48,7 +78,8 @@ def get_video_session(video_id: str):
             ),
 
             "alert_active": False,
-            "normal_frames": 0
+            "normal_frames": 0,
+            "warmup_consecutive_anomaly": 0
         }
 
         print(f"[SESSION] Created: {video_id}")
@@ -138,6 +169,90 @@ async def generate_incident_report(alert, frames):
 
 
 # ==========================================
+# VIDEO ASSET UPLOAD API
+# ==========================================
+
+@app.post("/api/v1/videos/upload")
+async def upload_video_assets(
+    video_id: str = Form(...),
+    tracked_video: UploadFile = File(...),
+    tracking_json: UploadFile = File(...)
+):
+
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", video_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid video ID"
+        )
+
+    extension = Path(
+        tracked_video.filename or ""
+    ).suffix.lower()
+
+    if extension not in SUPPORTED_VIDEO_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported tracked video format"
+        )
+
+    video_dir = TRACKED_VIDEO_DIR / video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    video_path = video_dir / f"{video_id}{extension}"
+    json_path = TRACKING_DATA_DIR / f"{video_id}.json"
+
+    try:
+
+        # Save tracked video
+        with open(video_path, "wb") as video_file:
+            shutil.copyfileobj(
+                tracked_video.file,
+                video_file
+            )
+
+        # Read and validate tracking JSON
+        json_content = await tracking_json.read()
+
+        try:
+            json.loads(json_content)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid tracking JSON"
+            )
+
+        with open(json_path, "wb") as json_file:
+            json_file.write(json_content)
+
+        print(f"[UPLOAD] Video saved: {video_path}")
+        print(f"[UPLOAD] Tracking data saved: {json_path}")
+
+        return {
+            "status": "success",
+            "video_id": video_id,
+            "video_path": str(video_path),
+            "tracking_path": str(json_path)
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+
+        print("[UPLOAD ERROR]", error)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to store video assets"
+        )
+
+    finally:
+
+        await tracked_video.close()
+        await tracking_json.close()
+
+
+# ==========================================
 # FRAME INGESTION API
 # ==========================================
 
@@ -149,7 +264,7 @@ async def ingest_frame(frame: FramePayload):
     memory = session["memory"]
     detector = session["detector"]
 
-    # Store frame
+    # Store incoming frame
     memory.push(frame)
 
     # Extract temporal features
@@ -163,15 +278,32 @@ async def ingest_frame(frame: FramePayload):
 
     # Determine frame status
     is_warmup = not detector.is_calibrated
-    is_scored = detector.is_calibrated and len(memory.frames) >= 10
-    threshold = ANOMALY_TRIGGER if not is_warmup else WARMUP_ANOMALY_TRIGGER
-    threshold_crossed = score >= threshold and (is_scored or is_warmup)
+
+    is_scored = (
+        detector.is_calibrated
+        and len(memory.frames) >= 10
+    )
+
+    threshold = (
+        WARMUP_ANOMALY_TRIGGER
+        if is_warmup
+        else ANOMALY_TRIGGER
+    )
+
+    threshold_crossed = (
+        score >= threshold
+        and (is_scored or is_warmup)
+    )
+
     alert_emitted = False
 
-    # Track consecutive warmup frames above threshold
+    # Track consecutive warmup anomalies
     if is_warmup and score >= threshold:
-        session["warmup_consecutive_anomaly"] = session.get("warmup_consecutive_anomaly", 0) + 1
+
+        session["warmup_consecutive_anomaly"] += 1
+
     else:
+
         session["warmup_consecutive_anomaly"] = 0
 
     print(
@@ -183,9 +315,7 @@ async def ingest_frame(frame: FramePayload):
         f"Warmup={is_warmup} | "
         f"Scored={is_scored} | "
         f"Threshold={threshold} | "
-        f"Crossed={threshold_crossed} | "
-        f"WarmupConsecutive={session.get('warmup_consecutive_anomaly', 0)}/{WARMUP_CONSECUTIVE_FRAMES} | "
-        f"WarmupSamples={len(detector.warmup_samples)}/{detector.warmup_frames}"
+        f"Crossed={threshold_crossed}"
     )
 
     alert_payload: Optional[AnomalyAlert] = None
@@ -194,9 +324,19 @@ async def ingest_frame(frame: FramePayload):
     # ANOMALY DETECTION
     # ======================================
 
-    warmup_consecutive_met = is_warmup and session.get("warmup_consecutive_anomaly", 0) >= WARMUP_CONSECUTIVE_FRAMES
+    warmup_consecutive_met = (
+        is_warmup
+        and session["warmup_consecutive_anomaly"]
+        >= WARMUP_CONSECUTIVE_FRAMES
+    )
 
-    if (score >= threshold and len(memory.frames) >= 10) and (not is_warmup or warmup_consecutive_met):
+    should_trigger = (
+        score >= threshold
+        and len(memory.frames) >= 10
+        and (not is_warmup or warmup_consecutive_met)
+    )
+
+    if should_trigger:
 
         session["normal_frames"] = 0
         alert_emitted = True
@@ -206,10 +346,11 @@ async def ingest_frame(frame: FramePayload):
             session["alert_active"] = True
 
             phase = "WARMUP" if is_warmup else "SCORED"
+
             print(
                 f"\n[ALERT] New anomaly detected ({phase}): "
                 f"{frame.video_id} | Score={score:.3f} | "
-                f"Frame={frame.frame_id} | Threshold={threshold}"
+                f"Frame={frame.frame_id}"
             )
 
             # Generate evidence-based alert
@@ -228,7 +369,6 @@ async def ingest_frame(frame: FramePayload):
                 list(memory.frames)
             )
 
-            # Update alert with full report
             alert_payload = alert_payload.model_copy(
                 update={
                     "explanation": explanation
@@ -236,79 +376,167 @@ async def ingest_frame(frame: FramePayload):
             )
 
             # ==================================
-            # GENERATE PDF REPORT WITH SCREENSHOTS
+            # GENERATE PDF REPORT
             # ==================================
 
             try:
-                # The alert's video_id might be different from the original tracking data video_id
-                # (e.g., client uses a different ID when sending frames to API)
-                # We need to find the tracking data that matches the alert's evidence frames AND timestamps
-                evidence_frames = set(alert_payload.evidence_frames)
 
-                # Get timestamps for evidence frames - use tracking data since memory.frames only keeps last 40 frames
-                evidence_timestamps = {}
+                evidence_frames = set(
+                    alert_payload.evidence_frames
+                )
 
                 video_path = None
+
                 video_fps = 24.0
                 video_width = 1280
                 video_height = 720
 
-                # Direct lookup: tracking files are named by video_id (see video_processor.py)
-                BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
                 tracking_video_id = alert_payload.video_id
-                tracking_file = BASE_DIR / "output" / "tracking_data" / f"{tracking_video_id}.json"
+
+                tracking_file = (
+                    TRACKING_DATA_DIR
+                    / f"{tracking_video_id}.json"
+                )
 
                 if tracking_file.exists():
-                    print(f"[PDF DEBUG] Loading tracking data from {tracking_file}")
-                    with open(tracking_file, 'r') as f:
-                        tracking_records = json.load(f)
-                    if tracking_records:
-                        # Build mapping of frame -> timestamp for this tracking data
-                        tracking_frame_timestamps = {r.get("frame"): r.get("timestamp") for r in tracking_records if "frame" in r and "timestamp" in r}
 
-                        # Check if all evidence frames exist in this tracking data
-                        missing_frames = [ef for ef in evidence_frames if ef not in tracking_frame_timestamps]
-                        if missing_frames:
-                            print(f"[PDF DEBUG] {tracking_file.name}: missing frames {missing_frames}")
+                    print(
+                        f"[PDF DEBUG] Loading tracking data: "
+                        f"{tracking_file}"
+                    )
+
+                    with open(tracking_file, "r") as file:
+                        tracking_records = json.load(file)
+
+                    tracking_frame_timestamps = {
+                        record["frame"]: record["timestamp"]
+                        for record in tracking_records
+                        if "frame" in record
+                        and "timestamp" in record
+                    }
+
+                    missing_frames = [
+                        ef for ef in evidence_frames
+                        if ef not in tracking_frame_timestamps
+                    ]
+
+                    if missing_frames:
+
+                        print(
+                            f"[PDF WARNING] Missing evidence frames: "
+                            f"{missing_frames}"
+                        )
+
+                    else:
+
+                        # Verify timestamps
+                        matches = True
+
+                        for evidence_frame in evidence_frames:
+
+                            alert_timestamp = next(
+                                (
+                                    stored_frame.timestamp
+                                    for stored_frame in memory.frames
+                                    if stored_frame.frame_id == evidence_frame
+                                ),
+                                None
+                            )
+
+                            if alert_timestamp is None:
+
+                                print(
+                                    f"[PDF DEBUG] Frame "
+                                    f"{evidence_frame} missing from memory"
+                                )
+
+                                matches = False
+                                break
+
+                            tracking_timestamp = (
+                                tracking_frame_timestamps[evidence_frame]
+                            )
+
+                            if abs(
+                                tracking_timestamp - alert_timestamp
+                            ) > 0.1:
+
+                                matches = False
+                                break
+
+                        if matches:
+
+                            tracked_video_dir = (
+                                TRACKED_VIDEO_DIR
+                                / tracking_video_id
+                            )
+
+                            video_files = (
+                                [
+                                    file
+                                    for file in tracked_video_dir.iterdir()
+                                    if file.suffix.lower()
+                                    in SUPPORTED_VIDEO_FORMATS
+                                ]
+                                if tracked_video_dir.exists()
+                                else []
+                            )
+
+                            if video_files:
+
+                                video_path = str(video_files[0])
+
+                                cap = cv2.VideoCapture(video_path)
+
+                                if cap.isOpened():
+
+                                    video_fps = cap.get(
+                                        cv2.CAP_PROP_FPS
+                                    )
+
+                                    video_width = int(
+                                        cap.get(
+                                            cv2.CAP_PROP_FRAME_WIDTH
+                                        )
+                                    )
+
+                                    video_height = int(
+                                        cap.get(
+                                            cv2.CAP_PROP_FRAME_HEIGHT
+                                        )
+                                    )
+
+                                cap.release()
+
+                                print(
+                                    f"[PDF] Found tracked video: "
+                                    f"{video_path}"
+                                )
+
+                            else:
+
+                                print(
+                                    f"[PDF WARNING] No tracked video "
+                                    f"found for {tracking_video_id}"
+                                )
+
                         else:
-                            # Build evidence_timestamps from this tracking data
-                            evidence_timestamps = {ef: tracking_frame_timestamps[ef] for ef in evidence_frames}
 
-                            # Verify timestamp match within 0.1s tolerance using ALERT timestamps
-                            matches = True
-                            for ef in evidence_frames:
-                                # Get alert's timestamp for this frame from memory (the authoritative source)
-                                alert_timestamp = None
-                                for frame in memory.frames:
-                                    if frame.frame_id == ef:
-                                        alert_timestamp = frame.timestamp
-                                        break
-                                if alert_timestamp is None:
-                                    print(f"[PDF DEBUG] Frame {ef} not found in memory frames")
-                                    matches = False
-                                    break
-                                diff = abs(tracking_frame_timestamps[ef] - alert_timestamp)
-                                if diff > 0.1:
-                                    matches = False
-                                    break
+                            print(
+                                "[PDF WARNING] Evidence timestamps "
+                                "do not match tracking data"
+                            )
 
-                            if matches:
-                                tracked_video_dir = BASE_DIR / "output" / "tracked_videos" / tracking_video_id
-                                video_files = list(tracked_video_dir.glob("*.avi")) if tracked_video_dir.exists() else []
-                                if video_files:
-                                    video_path = str(video_files[0])
-                                    cap = cv2.VideoCapture(video_path)
-                                    video_fps = cap.get(cv2.CAP_PROP_FPS)
-                                    video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                                    video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                                    cap.release()
-                                    print(f"[PDF] Found matching tracked video: {video_path} (tracking: {tracking_video_id})")
-                                else:
-                                    print(f"[PDF WARNING] No tracked avi found for {tracking_video_id}")
                 else:
-                    print(f"[PDF WARNING] Tracking file not found: {tracking_file}")
 
+                    print(
+                        f"[PDF WARNING] Tracking file not found: "
+                        f"{tracking_file}"
+                    )
+
+                # Generate PDF
                 if video_path:
+
                     pdf_path = await asyncio.to_thread(
                         generate_pdf_report,
                         alert_payload,
@@ -318,16 +546,27 @@ async def ingest_frame(frame: FramePayload):
                         video_width,
                         video_height
                     )
-                    print(f"[PDF] Report generated: {pdf_path}")
+
+                    print(
+                        f"[PDF] Report generated: {pdf_path}"
+                    )
+
                     alert_payload.pdf_report_path = pdf_path
+
                 else:
-                    print(f"[PDF WARNING] No tracked video found matching evidence frames: {evidence_frames}")
+
+                    print(
+                        "[PDF WARNING] PDF generation skipped. "
+                        "Matching tracked video unavailable."
+                    )
+
             except Exception as pdf_error:
-                print(f"[PDF ERROR] {pdf_error}")
+
+                print("[PDF ERROR]", pdf_error)
                 traceback.print_exc()
 
             # ==================================
-            # BROADCAST TO FRONTEND
+            # BROADCAST ALERT
             # ==================================
 
             await broadcast_alert(alert_payload)
@@ -344,12 +583,12 @@ async def ingest_frame(frame: FramePayload):
     else:
 
         if is_scored:
-            # Only count as normal frame if we're in scoring mode
             session["normal_frames"] += 1
 
         if session["normal_frames"] >= NORMAL_FRAMES_TO_RESET:
 
             if session["alert_active"]:
+
                 print(
                     f"[ALERT RESET] Video={frame.video_id}"
                 )
@@ -389,7 +628,6 @@ def health():
 
     return {
         "status": "healthy",
-
         "active_video_sessions": len(video_sessions),
 
         "sessions": {
@@ -419,20 +657,34 @@ def health():
 
 @app.get("/api/v1/reports/{report_filename}")
 def download_report(report_filename: str):
-    """Download a generated PDF report by filename."""
-    BASE_DIR = Path(__file__).resolve().parent.parent
-    report_path = BASE_DIR / "output" / "reports" / report_filename
+
+    # Prevent path traversal
+    if Path(report_filename).name != report_filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid report filename"
+        )
+
+    if not report_filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid report format"
+        )
+
+    report_path = REPORT_DIR / report_filename
 
     if not report_path.exists():
-        return Response(content="Report not found", status_code=404)
 
-    with open(report_path, "rb") as f:
-        content = f.read()
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found"
+        )
 
     return Response(
-        content=content,
+        content=report_path.read_bytes(),
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{report_filename}"'
+            "Content-Disposition":
+                f'attachment; filename="{report_filename}"'
         }
     )

@@ -143,6 +143,22 @@ def process_video(video_path, video_id=None):
     with open(json_path, "w", encoding="utf-8") as file:
         json.dump(records, file, indent=4)
 
+    # Locate the generated annotated video
+    annotated_dir = TRACKED_DIR / video_id
+
+    tracked_video_path = None
+
+    if annotated_dir.exists():
+        video_files = [
+        file for file in annotated_dir.iterdir()
+        if file.suffix.lower() in FORMATS
+    ]
+
+    if video_files:
+        tracked_video_path = str(
+            max(video_files, key=lambda file: file.stat().st_mtime)
+        )
+
     print("\nProcessing completed!")
     print("Video ID:", video_id)
     print("Original resolution:", f"{width}x{height}")
@@ -165,6 +181,7 @@ def process_video(video_path, video_id=None):
         "unique_tracks": len(unique_ids),
         "tracking_json": str(json_path),
         "annotated_video_directory": str(TRACKED_DIR / video_id),
+        "tracked_video_path": tracked_video_path,
         "records": records
     }
 

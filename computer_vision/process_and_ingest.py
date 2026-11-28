@@ -1,5 +1,6 @@
 import sys
 import json
+import requests
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
@@ -20,6 +21,41 @@ def send_frame(api_url, payload):
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read().decode("utf-8"))
 
+def upload_video_assets(api_url, video_id, video_path, tracking_json):
+
+    if not video_path or not Path(video_path).exists():
+        raise FileNotFoundError("Tracked video was not generated.")
+
+    if not Path(tracking_json).exists():
+        raise FileNotFoundError("Tracking JSON was not generated.")
+
+    print("Uploading tracked video and tracking JSON to backend...")
+
+    with open(video_path, "rb") as video_file, \
+         open(tracking_json, "rb") as json_file:
+
+        response = requests.post(
+            api_url + "/api/v1/videos/upload",
+            data={"video_id": video_id},
+            files={
+                "tracked_video": (
+                    Path(video_path).name,
+                    video_file
+                ),
+                "tracking_json": (
+                    Path(tracking_json).name,
+                    json_file,
+                    "application/json"
+                )
+            },
+            timeout=300
+        )
+
+    response.raise_for_status()
+
+    print("Video assets uploaded successfully!")
+    return response.json()
+
 
 def main():
 
@@ -30,6 +66,12 @@ def main():
     print("Starting NEMESIS-X video analysis...")
 
     result = process_video(video_path, video_id)
+    upload_video_assets(
+    api_url,
+    video_id,
+    result["tracked_video_path"],
+    result["tracking_json"]
+)
 
     frames = defaultdict(list)
     timestamps = {}
